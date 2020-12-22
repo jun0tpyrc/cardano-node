@@ -30,11 +30,15 @@ import qualified Data.Text.IO as Text
 import qualified Data.Vector as Vector
 import           Numeric (showEFloat)
 
-import           Control.Monad.Trans.Except.Extra (firstExceptT, handleIOExceptT, newExceptT)
+import           Control.Monad.Trans.Except.Extra (firstExceptT, handleIOExceptT, hoistMaybe, left,
+                     newExceptT)
 
 import           Cardano.Api
+import           Cardano.Api.Block
 import           Cardano.Api.Byron
+import qualified Cardano.Api.IPC as NewIPC
 import           Cardano.Api.LocalChainSync (getLocalTip)
+import           Cardano.Api.Modes (AnyConsensusModeParams (..), toEraInMode)
 import           Cardano.Api.Protocol
 import           Cardano.Api.Shelley
 
@@ -84,6 +88,8 @@ data ShelleyQueryCmdError
   | ShelleyQueryCmdLocalStateQueryError !ShelleyQueryCmdLocalStateQueryError
   | ShelleyQueryCmdWriteFileError !(FileError ())
   | ShelleyQueryCmdHelpersError !HelpersError
+  | ShelleyQueryCmdAcquireFailure AcquireFailure
+  | ShelleyQueryCmdEraConsensusModeMismatch !AnyCardanoEra !AnyConsensusModeParams
   deriving Show
 
 renderShelleyQueryCmdError :: ShelleyQueryCmdError -> Text
@@ -93,12 +99,16 @@ renderShelleyQueryCmdError err =
     ShelleyQueryCmdLocalStateQueryError lsqErr -> renderLocalStateQueryError lsqErr
     ShelleyQueryCmdWriteFileError fileErr -> Text.pack (displayError fileErr)
     ShelleyQueryCmdHelpersError helpersErr -> renderHelpersError helpersErr
+    ShelleyQueryCmdAcquireFailure aqFail -> Text.pack $ show aqFail
+    ShelleyQueryCmdEraConsensusModeMismatch (AnyCardanoEra era) (AnyConsensusModeParams cModeParams) ->
+      "Consensus mode and era mismatch. Consensus mode: " <> show cModeParams <>
+      " Era: " <> show era
 
 runQueryCmd :: QueryCmd -> ExceptT ShelleyQueryCmdError IO ()
 runQueryCmd cmd =
   case cmd of
-    QueryProtocolParameters era protocol network mOutFile ->
-      runQueryProtocolParameters era protocol network mOutFile
+    QueryProtocolParameters era _protocol network mOutFile ->
+      runQueryProtocolParameters era (panic "ConsensusModeParams") network mOutFile
     QueryTip protocol network mOutFile ->
       runQueryTip protocol network mOutFile
     QueryStakeDistribution era protocol network mOutFile ->
@@ -114,19 +124,37 @@ runQueryCmd cmd =
 
 runQueryProtocolParameters
   :: AnyCardanoEra
-  -> Protocol
+  -> AnyConsensusModeParams
   -> NetworkId
   -> Maybe OutputFile
   -> ExceptT ShelleyQueryCmdError IO ()
-runQueryProtocolParameters (AnyCardanoEra era) protocol network mOutFile
-  | ShelleyBasedEra era' <- cardanoEraStyle era = do
+runQueryProtocolParameters anyEra@(AnyCardanoEra era) anyCmodeParams@(AnyConsensusModeParams cModeParams) network mOutFile
+  | (ShelleyBasedEra era') <- cardanoEraStyle era = do
+      SocketPath sockPath <- firstExceptT ShelleyQueryCmdEnvVarSocketErr
+                               readEnvSocketPath
+      eraInMode <- hoistMaybe (ShelleyQueryCmdEraConsensusModeMismatch anyEra anyCmodeParams) $ toEraInMode cModeParams era
 
-    SocketPath sockPath <- firstExceptT ShelleyQueryCmdEnvVarSocketErr
-                           readEnvSocketPath
-    pparams <- firstExceptT ShelleyQueryCmdLocalStateQueryError $
-               withlocalNodeConnectInfo protocol network sockPath $
-                 queryPParamsFromLocalState era'
-    writeProtocolParameters mOutFile pparams
+      let localNodeConnInfo = NewIPC.LocalNodeConnectInfo
+                                { NewIPC.localConsensusModeParams = cModeParams
+                                , NewIPC.localNodeNetworkId = network
+                                , NewIPC.localNodeSocketPath = sockPath
+                                }
+          qInMode = NewIPC.QueryInEra eraInMode (NewIPC.QueryInShelleyBasedEra era' (panic "Protocol Parameters Query"))
+
+      tip <- liftIO $ NewIPC.getLocalTip localNodeConnInfo
+
+      res <- liftIO $ NewIPC.queryNodeLocalState localNodeConnInfo (chainTipToChainPoint tip) qInMode
+      case res of
+        Left acqFailure -> left $ ShelleyQueryCmdAcquireFailure acqFailure
+        Right ePparams ->
+          case ePparams of
+            Left err -> left . ShelleyQueryCmdLocalStateQueryError $ EraMismatchError err
+            Right pparams -> writeProtocolParameters mOutFile pparams
+
+    --pparams <- firstExceptT ShelleyQueryCmdLocalStateQueryError $
+    --           withlocalNodeConnectInfo protocol network sockPath $
+    --             queryPParamsFromLocalState era'
+    --writeProtocolParameters mOutFile pparams
 
   | otherwise = throwError (ShelleyQueryCmdLocalStateQueryError
                               ByronProtocolNotSupportedError)
